@@ -19,7 +19,7 @@ sub lookup_snapshot {
 		$search_uri = "http://snapshot.debian.org/binary/$pkg/";
 	}
 	warn "* Querying $search_uri...\n";
-	$mech->get( $search_uri );
+	$mech->get( $search_uri );	# :XXX: try multiple times?
 	
 	$text_regex = qr/^\Q$vers\E( |$)/;
 	$link = $mech->find_link( text_regex => $text_regex );
@@ -31,7 +31,7 @@ sub lookup_snapshot {
 	$search_uri = $link->url_abs();
 	warn "* Querying $search_uri...\n";
 	$search_uri =~ s/#.*$//;	# Disregard anchors in URI
-	$mech->get( $search_uri );
+	$mech->get( $search_uri );	# :XXX: try multiple times?
 	
 	$vers =~ s/^[0-9]+://;		# Disregard version epoch
 	if ($arch eq "source") {
@@ -40,7 +40,10 @@ sub lookup_snapshot {
 		$text_regex = qr/^\Q$pkg\E\_\Q$vers\E\_(all|$arch)\.deb$/;
 	}
 
-	$link = $mech->find_link( text_regex => $text_regex );
+	$link = $mech->find_link(
+		text_regex => $text_regex,
+		url_abs_regex => qr#/archive/debian/#
+	);
 	if (!defined $link) {
 		warn "$text_regex not found on page!";
 		return undef;
@@ -66,8 +69,10 @@ if (!defined $ARGV[0] or !stat $ARGV[0]) {
 }
 
 my $buildinfo = Dpkg::Control::Info->new(
+	allow_pgp => 1, #:XXX: doesn't work yet
 	filename => $ARGV[0]
 );
+
 my $fields = $buildinfo->get_source();
 my $installed_build_depends = deps_parse(
 	$fields->{'Installed-Build-Depends'},
@@ -77,24 +82,22 @@ my $installed_build_depends = deps_parse(
 my $build_user = 'sbuild';
 my $build_path = $fields->{'Build-Path'};
 
-my $pkg = $fields->{'Source'};
+my $pkg  = $fields->{'Source'};
 my $vers = $fields->{'Version'};
+my $arch = $fields->{'Architecture'};
 
-my $arch = `dpkg-architecture -qDEB_HOST_ARCH`;
-chomp $arch;
+$pkg  =~ s/ .*$//;		# Discard version numbers seen in buildinfo format 0.2
+# :XXX: format 0.2 has incomplete Pre-Depends?
+
+$vers =~ s/\+b[0-9]+$//;	# Disregard binNMU version # :XXX: still fails
+
+$arch =~ s/^all //;	# :XXX: hackish workaround
+$arch =~ s/ source$//;  # :XXX: fails badly with arch:all packages
 
 my @cmd_update  = qw(apt-get update);
-my @cmd_install = qw(apt-get -y install);
+my @cmd_install = qw(apt-get -y --allow-downgrades install);
 
-my $sources_list = "/etc/apt/sources.list.d/repro-build-env.list";
-unlink $sources_list;
-
-# Sanity check
-warn "* Executing @cmd_update\n";
-$exit_status = system(@cmd_update);
-exit if ($exit_status != 0);
-
-open (my $outfile, '>', $sources_list) or die $!;
+open (my $outfile, '>', 'repro-build-env.list') or die $!;
 
 # Find snapshot containing the source we want to build
 my $apt_src_source = lookup_snapshot($pkg, $vers, 'source');
@@ -120,40 +123,24 @@ foreach (@deps) {
 }
 
 close $outfile or die $!;
+warn "Created repro-build-env.list\n";
+
+# Create a pre-build script
+open ($outfile, '>', 'script.sh') or die $!;
 
 # Update with new package lists
-warn "* Executing @cmd_update\n";
-$exit_status = system(@cmd_update);
-exit if ($exit_status != 0);
+print $outfile "@cmd_update\n" or die $!;
 
 # Install the build dependencies
-warn "* Executing @cmd_install\n";
-$exit_status = system(@cmd_install);
-exit if ($exit_status != 0);
+print $outfile "@cmd_install\n" or die $!;
 
-# Create the build user
-system("adduser --disabled-password --gecos ',,,' $build_user");
-
-# Create the build path
-$build_path =~ m#^(.*/)([^/]+)$#;
-
-my $buildinfo_filename = $pkg."_".$vers."_".$arch;
-
-system("mkdir -p $1");
-system("chown -R $build_user:$build_user $1");
-system("cp $ARGV[0] $1/$buildinfo_filename.orig");
-chdir($1);
-
-# Fetch and unpack source
-open ($outfile, '>', 'build.sh') or die $!;
-print $outfile "#!/bin/sh -e\n" or die $!;
-print $outfile "apt-get source $pkg=$vers\n" or die $!;
-print $outfile "cd $2\n" or die $!;
-print $outfile "export DEB_BUILD_OPTIONS='nocheck parallel=2'\n" or die $!;
-print $outfile "dpkg-buildpackage -B 2>&1 | tee ../build.log\n" or die $!;
 close $outfile or die $!;
-system("chmod +x build.sh\n");
-system("su $build_user -s /bin/sh -c ./build.sh");
+warn "Created script.sh\n";
 
-# Process buildinfo
-system("diff -Nru $buildinfo_filename.orig $buildinfo_filename");
+# Discard the last component of the path
+$build_path =~ m#^(.*)/([^/]+)$#;
+
+warn "Starting sbuild...\n";
+exec("./sbuild.sh --build-path \"$1\" \"".$pkg."_".$vers."\"");
+# :XXX: build-path may be missing in build-info
+# :XXX: this script and sbuild.sh must be in the home directory
